@@ -1,24 +1,36 @@
 ---
 job: extension
 config:
-  name: "my_qwen_dpo_run"
+  # 1. Point to your extension file
+  extension_file: "extensions/qwen_dpo/DDPOTrainer.py"
+  name: "qwen_dpo_experiment"
+  
   process:
-    - type: "qwen_dpo"  # Matches the UID in __init__.py
-
-      # Process specific config
+    - type: "ddpo_trainer"  # Matches the UID in __init__.py (check if it's 'qwen_dpo' or 'dpo_trainer')
+      
+      # 2. System Settings
       device: "cuda:0"
       dtype: "bf16"
-      num_epochs: 3
-      save_root: "output/dpo_checkpoints"
-      dpo_beta: 2500
-
+      num_epochs: 50       # DPO converges fast, but needs steps
+      save_root: "/workspace/output_copy/sd3_dpo_checkpoints"
+      save_steps: 100
+      
+      # 3. DPO Hyperparameters
+      dpo_beta: 200       # Controls how strong the preference is (2000-5000 is standard)
+      max_train_steps: 20
+      num_epochs: 100 # for actual training, use 5
+      
+      # 4. Model Config
       model:
-        name_or_path: "Qwen/Qwen2.5-VL-7B-Instruct"
-
+        name_or_path: "stabilityai/stable-diffusion-3.5-medium" 
+      
+      # 5. Optimizer
       optimizer:
         optimizer: "adamw8bit"
-        lr: 1e-5
-
+        lr: 1e-5           # Low learning rate is key for DPO
+        weight_decay: 1e-2
+      
+      # 6. Dataset (Points to your .pt files)
       dataset:
-        root_path: "/path/to/precomputed_tensors"
-        batch_size: 1
+        root_path: "/workspace/BATCH_GENERATION/sd3/latents"  # <--- UPDATE THIS
+        batch_size: 1      # Keep at 1. DPO uses 4x memory (2 models x 2 images)
