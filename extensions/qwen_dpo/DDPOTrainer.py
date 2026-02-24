@@ -1,178 +1,191 @@
 import torch
 import torch.nn.functional as F
 import copy
-import json
 import os
-import inspect
 import gc
-from huggingface_hub import snapshot_download, list_repo_files, hf_hub_download
 from jobs.process import BaseProcess
-from diffusers import FlowMatchEulerDiscreteScheduler, Transformer2DModel
-from safetensors.torch import load_file
+from diffusers import (
+    FlowMatchEulerDiscreteScheduler, 
+    Transformer2DModel, 
+    SD3Transformer2DModel, 
+    FluxTransformer2DModel
+)
+from peft import LoraConfig, get_peft_model
+from huggingface_hub import model_info
 
+HF_TOKEN=""
 
 class DDPOTrainer(BaseProcess):
     def __init__(self, process_id, job, config):
         super().__init__(process_id, job, config)
         self.device = torch.device(self.config.get('device', 'cuda'))
         self.dtype = torch.bfloat16 if self.config.get('dtype') == 'bf16' else torch.float16
+        self.model_type = "generic" # Will be auto-detected
 
-    def load_model(self):
+    def detect_and_load_model(self):
         model_id = self.config['model']['name_or_path']
-        print(f"Loading Qwen-Image DiT: {model_id}")
+        print(f"--- UNIVERSAL LOADER: Inspecting {model_id} ---")
 
-        self.scheduler = FlowMatchEulerDiscreteScheduler(
-            num_train_timesteps=1000,
-            shift=3.0,
-            use_dynamic_shifting=False
-        )
-
+        # 1. Inspect HuggingFace Config to find Architecture
         try:
-            # 1. DOWNLOAD CONFIG & WEIGHTS
-            print(f"DEBUG: Ensuring weights are present...")
-            local_dir = snapshot_download(repo_id=model_id, allow_patterns=["transformer/*"])
-            transformer_path = os.path.join(local_dir, "transformer")
-
-            config_file = os.path.join(transformer_path, "config.json")
-            if not os.path.exists(config_file):
-                raise FileNotFoundError(f"Config file missing at {config_file}")
-
-            with open(config_file, 'r') as f:
-                raw_config = json.load(f)
-
-            # 2. CONSTRUCT "NUCLEAR" CONFIG (Safe Defaults)
-            final_config = {
-                "sample_size": 128,
-                "patch_size": 2,
-                "in_channels": 4,
-                "num_layers": 28,
-                "attention_head_dim": 72,
-                "num_attention_heads": 16,
-                "out_channels": 4,
-                "cross_attention_dim": 3584,
-                "norm_type": "ada_norm_zero",
-                "num_embeds_ada_norm": 1000,
-                "dropout": 0.0,
-                "activation_fn": "gelu-approximate",
-                "use_linear_projection": True
-            }
-
-            # 3. MERGE REPO CONFIG
-            valid_args = set(inspect.signature(Transformer2DModel.__init__).parameters.keys())
-            for key, value in raw_config.items():
-                if key in valid_args and key not in ["_class_name", "architectures", "_name_or_path"]:
-                    final_config[key] = value
-
-            # 4. CRITICAL OVERRIDES
-            final_config["cross_attention_dim"] = 3584
-            final_config["norm_type"] = "ada_norm_zero"
-            if "sample_size" not in final_config: final_config["sample_size"] = 128
-
-            # 5. INITIALIZE MODEL (Empty Shell on CPU)
-            print("DEBUG: Initializing Model Shell (CPU)...")
-            self.model = Transformer2DModel(**final_config)
-
-            # 6. STREAMING WEIGHT LOADING (Low RAM Mode)
-            print("DEBUG: Streaming weights (Iterative Loading)...")
-            weight_files = [f for f in os.listdir(transformer_path) if f.endswith('.safetensors')]
-            weight_files.sort()
-
-            for i, w_file in enumerate(weight_files):
-                w_path = os.path.join(transformer_path, w_file)
-                print(f"  - Loading shard {i + 1}/{len(weight_files)}: {w_file} ...", end="", flush=True)
-
-                # Load SINGLE shard to RAM
-                shard_dict = load_file(w_path)
-
-                # Update Model (In-Place)
-                mismatches = self.model.load_state_dict(shard_dict, strict=False)
-
-                # DELETE IMMEDIATELY
-                del shard_dict
-                gc.collect()
-                print(" Done. RAM Cleared.")
-
-            print("SUCCESS: All shards loaded.")
-
-            # 7. MOVE TO GPU (Clears System RAM, Fills VRAM)
-            print(f"DEBUG: Moving Model to GPU ({self.device})...")
-            self.model.to(self.device, dtype=self.dtype)
-            torch.cuda.empty_cache()
-
-            # 8. CREATE REFERENCE MODEL (On GPU)
-            # We copy from GPU-to-GPU, avoiding CPU RAM entirely
-            print("DEBUG: Creating Reference Model (VRAM Copy)...")
-            self.ref_model = copy.deepcopy(self.model)
-            self.ref_model.requires_grad_(False)
-            self.ref_model.eval()
+            info = model_info(model_id)
+            config_file = [f for f in info.siblings if f.rfilename.endswith("config.json")]
+            # Heuristics based on model ID if config check is ambiguous
+            if "stable-diffusion-3" in model_id.lower():
+                print(f"Detected Architecture: Stable Diffusion 3 (MMDiT)")
+                self.model_type = "sd3"
+                return SD3Transformer2DModel.from_pretrained(model_id, subfolder="transformer", token=HF_TOKEN, torch_dtype=self.dtype)
+            
+            elif "flux" in model_id.lower():
+                print(f"Detected Architecture: FLUX.1")
+                self.model_type = "flux"
+                return FluxTransformer2DModel.from_pretrained(model_id, subfolder="transformer", token=HF_TOKEN, torch_dtype=self.dtype)
+            
+            elif "pixart" in model_id.lower() or "dit" in model_id.lower():
+                print(f"Detected Architecture: Standard DiT (PixArt/DiT)")
+                self.model_type = "dit"
+                return Transformer2DModel.from_pretrained(model_id, subfolder="transformer", token=HF_TOKEN, torch_dtype=self.dtype)
+            
+            else:
+                print(f"Architecture Unclear. Defaulting to Generic Transformer2DModel.")
+                self.model_type = "dit"
+                return Transformer2DModel.from_pretrained(model_id, subfolder="transformer", token=HF_TOKEN, torch_dtype=self.dtype)
 
         except Exception as e:
-            print(f"\nCRITICAL ERROR: Failed to load {model_id}")
-            print(f"Error Details: {e}")
-            raise e
+            print(f"Auto-detection failed: {e}")
+            print("Fallback: Trying Generic Load...")
+            self.model_type = "dit"
+            return Transformer2DModel.from_pretrained(model_id, subfolder="transformer", token=HF_TOKEN, torch_dtype=self.dtype)
 
+    def load_model(self):
+        # 1. Auto-Load Correct Class
+        self.model = self.detect_and_load_model()
+        self.model.to(self.device)
         self.model.enable_gradient_checkpointing()
 
-    def get_dit_prediction(self, model, latents, t, prompt_embeds, pooled_embeds):
-        kwargs = {
-            "hidden_states": latents,
-            "timestep": t,
-            "return_dict": False,
-            "encoder_hidden_states": prompt_embeds
-        }
-        bsz = latents.shape[0]
-        kwargs["class_labels"] = torch.zeros(bsz, device=self.device, dtype=torch.long)
-        return model(**kwargs)[0]
+        # 2. Universal LoRA Injection
+        # Targets the most common attention projection names across all architectures
+        print(f"Injecting Universal LoRA...")
+        target_modules = [
+            "to_q", "to_k", "to_v", "to_out.0",   # SD3 / DiT Standard
+            "q_proj", "k_proj", "v_proj", "o_proj", # LLaMA / Qwen Style
+            "add_k_proj", "add_v_proj"            # ID embeddings
+        ]
+        
+        lora_config = LoraConfig(
+            r=32, 
+            lora_alpha=32,
+            target_modules=target_modules, 
+            lora_dropout=0.0,
+            bias="none"
+        )
+        self.model = get_peft_model(self.model, lora_config)
+        self.model.print_trainable_parameters()
+        self.model.train()
+
+    def universal_forward(self, model, latents, t, prompt_embeds, pooled_embeds):
+        """
+        Adapts inputs to whatever weird format the specific model wants.
+        """
+        
+        # --- STABLE DIFFUSION 3 ---
+        if self.model_type == "sd3":
+            return model(
+                hidden_states=latents,
+                timestep=t,
+                encoder_hidden_states=prompt_embeds,
+                pooled_projections=pooled_embeds,
+                return_dict=False
+            )[0]
+
+        # --- FLUX ---
+        elif self.model_type == "flux":
+            # Flux usually requires 'guidance' (vector embedding)
+            # If dataset doesn't provide it, we fake a standard guidance value (e.g. 3.5)
+            bsz = latents.shape[0]
+            guidance = torch.tensor([3.5] * bsz, device=self.device, dtype=self.dtype)
+            
+            return model(
+                hidden_states=latents,
+                timestep=t / 1000, # Flux often expects 0-1 range
+                encoder_hidden_states=prompt_embeds,
+                pooled_projections=pooled_embeds,
+                guidance=guidance,
+                return_dict=False
+            )[0]
+
+        # --- STANDARD DiT (PixArt, Qwen-Image, DiT-XL) ---
+        else:
+            # Most generic DiTs just take hidden_states, timestep, and encoder_hidden_states
+            kwargs = {
+                "hidden_states": latents,
+                "timestep": t,
+                "encoder_hidden_states": prompt_embeds,
+                "return_dict": False
+            }
+            # Some DiTs (like Qwen) crash if class_labels isn't passed
+            # We pass dummy zeros just in case the config requires it
+            if hasattr(model.config, "num_embeds_ada_norm"):
+                 bsz = latents.shape[0]
+                 kwargs["class_labels"] = torch.zeros(bsz, device=self.device, dtype=torch.long)
+            
+            return model(**kwargs)[0]
 
     def run(self):
         self.load_model()
-
+        
         from .DDPODataset import DDPODataset
         dataset = DDPODataset(self.config['dataset'])
         dataloader = torch.utils.data.DataLoader(
-            dataset,
-            batch_size=self.config['dataset'].get('batch_size', 1),
-            shuffle=True
+            dataset, batch_size=self.config['dataset'].get('batch_size', 1), shuffle=True
         )
-
-        optimizer = self.get_optimizer(self.model.parameters())
-        self.model.train()
-
-        print(f"Starting Training...")
+        
+        optimizer = torch.optim.AdamW(self.model.parameters(), lr=1e-4)
+        
+        print(f"Starting Training ({self.model_type.upper()} Mode)...")
         beta = self.config.get('dpo_beta', 1000)
         global_step = 0
 
+        max_steps = self.config.get('max_train_steps', None) 
+        if max_steps:
+            print(f"DEBUG: Training will stop after {max_steps} steps.")
+
         for epoch in range(self.config.get('num_epochs', 10)):
             for batch in dataloader:
+                # Inputs
                 latents_w = batch['w_latents'].to(self.device, dtype=self.dtype)
                 latents_l = batch['l_latents'].to(self.device, dtype=self.dtype)
                 p_embeds = batch['prompt_embeds'].to(self.device, dtype=self.dtype)
                 pool_embeds = batch['pooled_embeds'].to(self.device, dtype=self.dtype)
-
+                
                 bsz = latents_w.shape[0]
-
-                noise = torch.randn(latents_w.shape, device=self.device, dtype=self.dtype)
+                noise = torch.randn_like(latents_w)
                 u = torch.rand((bsz,), device=self.device, dtype=self.dtype)
+                timesteps = u * 1000 
+                
+                # Add Noise (Simple Flow Match Interpolation)
                 u_view = u.view(bsz, 1, 1, 1)
-
                 noisy_w = (1.0 - u_view) * latents_w + u_view * noise
                 noisy_l = (1.0 - u_view) * latents_l + u_view * noise
-                timesteps = (u * 1000).long().to(self.device)
+                
+                # --- UNIVERSAL FORWARD PASS ---
+                pred_w = self.universal_forward(self.model, noisy_w, timesteps, p_embeds, pool_embeds)
+                pred_l = self.universal_forward(self.model, noisy_l, timesteps, p_embeds, pool_embeds)
+                
+                # Ref Step
+                with self.model.disable_adapter():
+                    with torch.no_grad():
+                        ref_pred_w = self.universal_forward(self.model, noisy_w, timesteps, p_embeds, pool_embeds)
+                        ref_pred_l = self.universal_forward(self.model, noisy_l, timesteps, p_embeds, pool_embeds)
 
-                pred_w = self.get_dit_prediction(self.model, noisy_w, timesteps, p_embeds, pool_embeds)
-                pred_l = self.get_dit_prediction(self.model, noisy_l, timesteps, p_embeds, pool_embeds)
-
-                with torch.no_grad():
-                    ref_pred_w = self.get_dit_prediction(self.ref_model, noisy_w, timesteps, p_embeds, pool_embeds)
-                    ref_pred_l = self.get_dit_prediction(self.ref_model, noisy_l, timesteps, p_embeds, pool_embeds)
-
+                # Loss
                 target_w = noise - latents_w
                 target_l = noise - latents_l
 
-                loss_w = F.mse_loss(pred_w, target_w, reduction="none").mean([1, 2, 3])
-                loss_l = F.mse_loss(pred_l, target_l, reduction="none").mean([1, 2, 3])
-                ref_loss_w = F.mse_loss(ref_pred_w, target_w, reduction="none").mean([1, 2, 3])
-                ref_loss_l = F.mse_loss(ref_pred_l, target_l, reduction="none").mean([1, 2, 3])
+                loss_w = F.mse_loss(pred_w.float(), target_w.float(), reduction="none").mean([1, 2, 3])
+                loss_l = F.mse_loss(pred_l.float(), target_l.float(), reduction="none").mean([1, 2, 3])
+                ref_loss_w = F.mse_loss(ref_pred_w.float(), target_w.float(), reduction="none").mean([1, 2, 3])
+                ref_loss_l = F.mse_loss(ref_pred_l.float(), target_l.float(), reduction="none").mean([1, 2, 3])
 
                 logits = (ref_loss_w - loss_w) - (ref_loss_l - loss_l)
                 loss = -torch.nn.functional.logsigmoid(beta * logits).mean()
@@ -181,17 +194,14 @@ class DDPOTrainer(BaseProcess):
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 optimizer.step()
                 optimizer.zero_grad()
-
+                
                 global_step += 1
                 if global_step % 10 == 0:
                     print(f"Step {global_step} Loss: {loss.item():.4f}")
 
+                if global_step >= max_steps:
+                    print("DEBUG: Reached max test steps. Stopping.")
+                    self.model.save_pretrained(self.config['save_root'])
+                    return
+        
         self.model.save_pretrained(self.config['save_root'])
-
-    def get_optimizer(self, params):
-        lr = float(self.config['optimizer'].get('lr', 1e-6))
-        try:
-            import bitsandbytes as bnb
-            return bnb.optim.AdamW8bit(params, lr=lr)
-        except:
-            return torch.optim.AdamW(params, lr=lr)
