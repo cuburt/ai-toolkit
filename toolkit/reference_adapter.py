@@ -30,12 +30,17 @@ from transformers import (
 )
 from toolkit.models.size_agnostic_feature_encoder import SAFEImageProcessor, SAFEVisionModel
 
-from transformers import ViTHybridImageProcessor, ViTHybridForImageClassification
+# from transformers import ViTHybridImageProcessor, ViTHybridForImageClassification
 
-from transformers import ViTFeatureExtractor, ViTForImageClassification
+# from transformers import ViTFeatureExtractor, ViTForImageClassification
 
 import torch.nn.functional as F
 import torch.nn as nn
+
+ViTHybridImageProcessor = None
+ViTHybridForImageClassification = None
+ViTFeatureExtractor = None
+ViTForImageClassification = None
 
 
 class ReferenceAttnProcessor2_0(torch.nn.Module):
