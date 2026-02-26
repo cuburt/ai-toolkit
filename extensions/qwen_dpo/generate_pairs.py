@@ -1,5 +1,4 @@
 import os
-import yaml
 import json
 import torch
 import gc
@@ -10,11 +9,9 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 def load_local_llm(model_id):
-    """Loads a lightweight local LLM in 8-bit to save VRAM."""
+    """Loads a lightweight local LLM to save VRAM."""
     print(f"Loading local LLM: {model_id}...")
     tokenizer = AutoTokenizer.from_pretrained(model_id)
-    # Loading in bfloat16 to match your diffusion dtype.
-    # Use load_in_8bit=True if you are super tight on VRAM.
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
         torch_dtype=torch.bfloat16,
@@ -28,7 +25,8 @@ def enhance_prompt_local(base_prompt, target_style, tokenizer, model):
     system_prompt = (
         f"You are an expert prompt engineer for the {target_style} image model. "
         "Expand the following simple prompt into a highly detailed, visually descriptive "
-        "prompt optimized for this architecture. Reply ONLY with the new prompt, no chat."
+        "prompt optimized for this architecture. Reply ONLY with the new prompt, no chat. "
+        "Do not include quotes or conversational filler."
     )
 
     messages = [
@@ -36,7 +34,6 @@ def enhance_prompt_local(base_prompt, target_style, tokenizer, model):
         {"role": "user", "content": base_prompt}
     ]
 
-    # Format for the specific instruct model
     text = tokenizer.apply_chat_template(
         messages,
         tokenize=False,
@@ -51,7 +48,6 @@ def enhance_prompt_local(base_prompt, target_style, tokenizer, model):
         do_sample=True
     )
 
-    # Strip the input context from the output
     generated_ids = [
         output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
     ]
@@ -68,11 +64,28 @@ def main(args):
     accepted_dir.mkdir(parents=True, exist_ok=True)
     rejected_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load base prompts
-    with open(args.yaml_file, 'r') as f:
-        base_prompts = yaml.safe_load(f).get('prompts', [])
+    # --- LOAD JSONL ---
+    base_prompts = []
+    print(f"Reading prompts from {args.jsonl_file} using key '{args.prompt_key}'...")
+    with open(args.jsonl_file, 'r', encoding='utf-8') as f:
+        for line_num, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                item = json.loads(line)
+                if args.prompt_key in item:
+                    base_prompts.append(item[args.prompt_key])
+                else:
+                    print(f"Warning: Key '{args.prompt_key}' not found on line {line_num}. Skipping.")
+            except json.JSONDecodeError:
+                print(f"Error: Invalid JSON on line {line_num}. Skipping.")
 
-    print(f"Loaded {len(base_prompts)} prompts from {args.yaml_file}.")
+    if not base_prompts:
+        print("No prompts found! Exiting.")
+        return
+
+    print(f"Successfully loaded {len(base_prompts)} prompts.")
 
     # --- PHASE 1: TEXT GENERATION ---
     tokenizer, llm = load_local_llm(args.llm_model)
@@ -98,10 +111,10 @@ def main(args):
         args.image_model,
         torch_dtype=torch.bfloat16
     ).to("cuda")
-    pipe.enable_model_cpu_offload()  # Extra safety for VRAM
+    pipe.enable_model_cpu_offload()
 
     metadata_path = out_dir / "metadata.jsonl"
-    with open(metadata_path, 'a') as metadata_file:
+    with open(metadata_path, 'a', encoding='utf-8') as metadata_file:
         for idx, (base_prompt, enhanced_prompt) in enumerate(zip(base_prompts, enhanced_prompts)):
             print(f"\nGenerating Image Pair {idx + 1}/{len(base_prompts)}...")
 
@@ -140,8 +153,9 @@ def main(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Generate DPO preference pairs locally.")
-    parser.add_argument("--yaml_file", type=str, required=True, help="Path to prompts.yaml")
+    parser = argparse.ArgumentParser(description="Generate DPO preference pairs locally from JSONL.")
+    parser.add_argument("--jsonl_file", type=str, required=True, help="Path to input.jsonl")
+    parser.add_argument("--prompt_key", type=str, default="image_prompt", help="Key containing the prompt in JSONL")
     parser.add_argument("--output_dir", type=str, default="./dpo_dataset")
     parser.add_argument("--llm_model", type=str, default="Qwen/Qwen2.5-3B-Instruct", help="HuggingFace LLM ID")
     parser.add_argument("--image_model", type=str, required=True, help="HuggingFace image model ID")
