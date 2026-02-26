@@ -76,16 +76,21 @@ def main(args):
                 item = json.loads(line)
                 if args.prompt_key in item:
                     base_prompts.append(item[args.prompt_key])
+
+                    # Stop reading if we hit the user's limit
+                    if args.max_samples > 0 and len(base_prompts) >= args.max_samples:
+                        print(f"Reached max_samples limit ({args.max_samples}). Stopping read.")
+                        break
                 else:
                     print(f"Warning: Key '{args.prompt_key}' not found on line {line_num}. Skipping.")
             except json.JSONDecodeError:
                 print(f"Error: Invalid JSON on line {line_num}. Skipping.")
 
     if not base_prompts:
-        print("No prompts found! Exiting.")
+        print("No valid prompts found! Exiting.")
         return
 
-    print(f"Successfully loaded {len(base_prompts)} prompts.")
+    print(f"Successfully loaded {len(base_prompts)} prompts to process.")
 
     # --- PHASE 1: TEXT GENERATION ---
     tokenizer, llm = load_local_llm(args.llm_model)
@@ -162,6 +167,7 @@ if __name__ == "__main__":
     parser.add_argument("--target_style", type=str, required=True, help="Instructions for the LLM")
     parser.add_argument("--steps", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--max_samples", type=int, default=0, help="Max number of prompts to process (0 = all)")
 
     args = parser.parse_args()
     main(args)
